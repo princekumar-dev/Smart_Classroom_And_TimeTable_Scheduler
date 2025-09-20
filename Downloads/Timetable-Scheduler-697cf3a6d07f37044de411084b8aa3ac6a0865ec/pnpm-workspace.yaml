@@ -1,5 +1,0 @@
-
-packages:
-  - 'shadcn-ui'
-onlyBuiltDependencies:
-  - core-js

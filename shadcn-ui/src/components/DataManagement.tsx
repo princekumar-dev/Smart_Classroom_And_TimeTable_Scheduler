@@ -67,14 +67,56 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
     return () => clearTimeout(timeoutId);
   }, [autoSaveData]);
 
+  // Helper function to migrate faculty eligibleSubjects from codes to IDs
+  const migrateFacultyEligibleSubjects = (faculty: Faculty[], subjects: Subject[]): Faculty[] => {
+    return faculty.map(f => {
+      // If eligibleSubjects contains subject IDs (contains hyphens for lab subjects), no migration needed
+      const hasSubjectIds = f.eligibleSubjects.some(id => subjects.find(s => s.id === id));
+      if (hasSubjectIds) return f;
+      
+      // Migrate from codes to IDs
+      const migratedEligibleSubjects = f.eligibleSubjects
+        .flatMap(code => {
+          // Find all subjects with this code (both theory and lab variants)
+          return subjects.filter(s => s.code === code).map(s => s.id);
+        })
+        .filter(id => id); // Remove any undefined values
+      
+      return {
+        ...f,
+        eligibleSubjects: migratedEligibleSubjects
+      };
+    });
+  };
+
   // Load saved data and setup from localStorage on mount
   useEffect(() => {
     const savedSubjects = localStorage.getItem('subjects');
     const savedFaculty = localStorage.getItem('faculty');
     const savedRooms = localStorage.getItem('rooms');
     const savedBatches = localStorage.getItem('batches');
-    if (savedSubjects) setSubjects(JSON.parse(savedSubjects));
-    if (savedFaculty) setFaculty(JSON.parse(savedFaculty));
+    
+    let loadedSubjects: Subject[] = [];
+    let loadedFaculty: Faculty[] = [];
+    
+    if (savedSubjects) {
+      loadedSubjects = JSON.parse(savedSubjects);
+      setSubjects(loadedSubjects);
+    }
+    
+    if (savedFaculty) {
+      const rawFaculty = JSON.parse(savedFaculty);
+      // Migrate faculty eligibleSubjects if needed
+      loadedFaculty = migrateFacultyEligibleSubjects(rawFaculty, loadedSubjects);
+      setFaculty(loadedFaculty);
+      
+      // If migration occurred, save the updated faculty data
+      if (JSON.stringify(rawFaculty) !== JSON.stringify(loadedFaculty)) {
+        localStorage.setItem('faculty', JSON.stringify(loadedFaculty));
+        console.log('✅ Faculty eligible subjects migrated from codes to IDs');
+      }
+    }
+    
     if (savedRooms) setRooms(JSON.parse(savedRooms));
     if (savedBatches) setBatches(JSON.parse(savedBatches));
     
@@ -93,6 +135,17 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
           subjectIds: subjects.map(subject => subject.id)
         }))
       );
+    }
+  }, [subjects]);
+
+  // Update faculty eligible subjects when subjects change (to handle ID updates)
+  useEffect(() => {
+    if (subjects.length > 0 && faculty.length > 0) {
+      const updatedFaculty = migrateFacultyEligibleSubjects(faculty, subjects);
+      if (JSON.stringify(faculty) !== JSON.stringify(updatedFaculty)) {
+        setFaculty(updatedFaculty);
+        console.log('✅ Faculty eligible subjects synchronized with subject changes');
+      }
     }
   }, [subjects]);
 
@@ -169,6 +222,76 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
     return errors;
   };
 
+  // Get real-time institution configuration
+  const getInstitutionConfig = () => {
+    const savedInstitution = localStorage.getItem('institution');
+    return savedInstitution ? JSON.parse(savedInstitution) : {
+      workingDays: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
+      periodsPerDay: 8,
+      periodTimings: Array.from({length: 8}, (_, i) => ({
+        period: i + 1,
+        startTime: `${8 + i}:30`,
+        endTime: `${9 + i}:20`
+      })),
+      breaks: []
+    };
+  };
+
+  // Enhanced validation with real-time institution awareness
+  const validateSubjectWithContext = (subject: Subject): string[] => {
+    const errors: string[] = [];
+    const institutionConfig = getInstitutionConfig();
+    
+    // Basic validation
+    if (!subject.name.trim()) errors.push('Subject name is required');
+    if (!subject.code.trim()) errors.push('Subject code is required');
+    if (subject.credits <= 0) errors.push('Credits must be greater than 0');
+    if (subject.weeklyHours <= 0) errors.push('Weekly hours must be greater than 0');
+    if (subject.sessionsPerWeek <= 0) errors.push('Sessions per week must be greater than 0');
+    if (subject.sessionDuration <= 0) errors.push('Session duration must be greater than 0');
+    if (subject.continuousHours <= 0) errors.push('Continuous hours must be greater than 0');
+    
+    // Institution-aware validation
+    if (subject.continuousHours > institutionConfig.periodsPerDay) {
+      errors.push(`Continuous hours (${subject.continuousHours}) cannot exceed daily periods (${institutionConfig.periodsPerDay})`);
+    }
+    
+    if (subject.weeklyHours > institutionConfig.periodsPerDay * institutionConfig.workingDays.length) {
+      const maxWeeklyPeriods = institutionConfig.periodsPerDay * institutionConfig.workingDays.length;
+      errors.push(`Weekly hours (${subject.weeklyHours}) exceeds maximum weekly periods (${maxWeeklyPeriods})`);
+    }
+    
+    // Lab-specific validation
+    if (subject.type === 'Lab') {
+      if (subject.weeklyHours < 2) {
+        errors.push('Lab subjects should have at least 2 weekly hours for proper continuous scheduling');
+      }
+      if (subject.sessionsPerWeek > 2) {
+        errors.push('Labs typically should not have more than 2 sessions per week');
+      }
+    }
+    
+    // Logic validation
+    if (subject.continuousHours > subject.weeklyHours) {
+      errors.push('Continuous hours cannot exceed weekly hours');
+    }
+    
+    // Check for duplicate codes
+    const existingSubject = subjects.find(s => s.code === subject.code && s.id !== subject.id);
+    if (existingSubject) {
+      errors.push(`Subject code '${subject.code}' is already in use`);
+    }
+    
+    // Session duration validation with real-time calculation
+    const expectedDurationPerSession = (subject.weeklyHours / subject.sessionsPerWeek) * 50;
+    const tolerance = subject.type === 'Lab' ? 20 : 10; // More tolerance for labs
+    if (Math.abs(subject.sessionDuration - expectedDurationPerSession) > tolerance) {
+      errors.push(`Session duration (${subject.sessionDuration}min) doesn't match expected duration (${expectedDurationPerSession.toFixed(0)}min) for ${subject.weeklyHours} hours in ${subject.sessionsPerWeek} session(s)`);
+    }
+    
+    return errors;
+  };
+
   // Enhanced data modification functions with validation
   const addSubject = (newSubject: Partial<Subject>) => {
     const subject: Subject = {
@@ -185,7 +308,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
       equipmentRequired: newSubject.equipmentRequired || []
     };
     
-    const validationErrors = validateSubject(subject);
+    const validationErrors = validateSubjectWithContext(subject);
     if (validationErrors.length === 0) {
       setSubjects(prev => [...prev, subject]);
       setIsSubjectDialogOpen(false);
@@ -223,12 +346,35 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
     );
 
     const [localErrors, setLocalErrors] = useState<string[]>([]);
+    const [realTimeValidation, setRealTimeValidation] = useState<string[]>([]);
+    const [institutionConfig, setInstitutionConfig] = useState(getInstitutionConfig());
 
     useEffect(() => {
       if (editingItem) {
         setFormData(editingItem);
       }
     }, [editingItem]);
+    
+    // Real-time validation whenever form data changes
+    useEffect(() => {
+      if (formData.name || formData.code || formData.weeklyHours || formData.sessionsPerWeek) {
+        const tempSubject = {
+          ...formData,
+          id: 'temp-validation-id'
+        } as Subject;
+        
+        const errors = validateSubjectWithContext(tempSubject);
+        setRealTimeValidation(errors);
+      } else {
+        setRealTimeValidation([]);
+      }
+    }, [formData]);
+
+    // Update institution config when component mounts
+    useEffect(() => {
+      const config = getInstitutionConfig();
+      setInstitutionConfig(config);
+    }, []);
 
     const handleSubmit = (e: React.FormEvent) => {
       e.preventDefault();
@@ -278,8 +424,79 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
       }
     };
 
-    // Quick preset templates for common scheduling patterns
+    // Smart auto-completion based on existing subjects
+    const getCodeSuggestions = () => {
+      const existingCodes = subjects.map(s => s.code);
+      const suggestions = [];
+      
+      // Extract common patterns
+      const patterns = existingCodes.map(code => {
+        const match = code.match(/([A-Z]+)(\d+)([A-Z]+)(\d+)/);
+        return match ? { prefix: match[1], year: match[2], dept: match[3], num: match[4] } : null;
+      }).filter(Boolean);
+      
+      // Generate suggestions based on patterns
+      if (patterns.length > 0) {
+        const commonPrefix = patterns[0]?.prefix || 'U';
+        const commonYear = patterns[0]?.year || '24';
+        const commonDept = patterns[0]?.dept || 'CS';
+        
+        suggestions.push(`${commonPrefix}${commonYear}${commonDept}3XX`);
+        suggestions.push(`${commonPrefix}${commonYear}${commonDept}4XX`);
+      }
+      
+      return suggestions;
+    };
+
+    // Dynamic field adaptation based on institution configuration
+    const getMaxSessionsPerWeek = () => institutionConfig.workingDays.length;
+    const getMaxContinuousHours = () => Math.floor(institutionConfig.periodsPerDay * 0.8); // 80% of daily periods
+    const getRecommendedSessionDuration = (weeklyHours: number, sessions: number) => {
+      const baseMinutes = (weeklyHours / sessions) * 50; // 50 min per period
+      return Math.round(baseMinutes / 10) * 10; // Round to nearest 10 minutes
+    };
+
+    // Auto-suggest values when certain fields change
+    const handleFieldChange = (field: string, value: any) => {
+      const newFormData = { ...formData, [field]: value };
+      
+      // Auto-adjust dependent fields
+      if (field === 'weeklyHours' || field === 'sessionsPerWeek') {
+        if (newFormData.weeklyHours > 0 && newFormData.sessionsPerWeek > 0) {
+          newFormData.sessionDuration = getRecommendedSessionDuration(
+            newFormData.weeklyHours, 
+            newFormData.sessionsPerWeek
+          );
+          
+          // Auto-adjust continuous hours for labs
+          if (newFormData.type === 'Lab' && newFormData.sessionsPerWeek === 1) {
+            newFormData.continuousHours = Math.min(newFormData.weeklyHours, getMaxContinuousHours());
+          }
+        }
+      }
+      
+      // Auto-suggest preferred time slots based on type
+      if (field === 'type') {
+        if (value === 'Lab') {
+          newFormData.preferredTimeSlots = ['Morning'];
+          // Ensure labs have proper configuration
+          if (newFormData.weeklyHours < 2) {
+            newFormData.weeklyHours = 2;
+            newFormData.continuousHours = 2;
+            newFormData.sessionDuration = getRecommendedSessionDuration(2, newFormData.sessionsPerWeek || 1);
+          }
+        } else if (value === 'Theory') {
+          newFormData.preferredTimeSlots = ['Morning'];
+        }
+      }
+      
+      setFormData(newFormData);
+    };
+
+    // Enhanced templates with dynamic adaptation
     const applyTemplate = (template: string) => {
+      const maxContinuous = getMaxContinuousHours();
+      
       switch (template) {
         case 'single-theory':
           setFormData(prev => ({
@@ -314,21 +531,36 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         case 'standard-lab':
           setFormData(prev => ({
             ...prev,
-            weeklyHours: 2,
+            weeklyHours: Math.min(2, maxContinuous),
             sessionsPerWeek: 1,
-            sessionDuration: 100,
-            continuousHours: 2,
-            type: 'Lab'
+            sessionDuration: getRecommendedSessionDuration(2, 1),
+            continuousHours: Math.min(2, maxContinuous),
+            type: 'Lab',
+            preferredTimeSlots: ['Morning'] // Labs prefer morning slots
           }));
           break;
         case 'extended-lab':
           setFormData(prev => ({
             ...prev,
-            weeklyHours: 3,
+            weeklyHours: Math.min(3, maxContinuous),
             sessionsPerWeek: 1,
-            sessionDuration: 150,
-            continuousHours: 3,
-            type: 'Lab'
+            sessionDuration: getRecommendedSessionDuration(3, 1),
+            continuousHours: Math.min(3, maxContinuous),
+            type: 'Lab',
+            preferredTimeSlots: ['Morning']
+          }));
+          break;
+        case 'adaptive-lab':
+          // New adaptive template based on institution config
+          const adaptiveHours = Math.min(Math.max(2, Math.floor(maxContinuous * 0.75)), maxContinuous);
+          setFormData(prev => ({
+            ...prev,
+            weeklyHours: adaptiveHours,
+            sessionsPerWeek: 1,
+            sessionDuration: getRecommendedSessionDuration(adaptiveHours, 1),
+            continuousHours: adaptiveHours,
+            type: 'Lab',
+            preferredTimeSlots: ['Morning']
           }));
           break;
         case 'distributed-theory':
@@ -391,6 +623,9 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
                 <Button type="button" size="sm" variant="outline" onClick={() => applyTemplate('extended-lab')}>
                   Extended Lab
                 </Button>
+                <Button type="button" size="sm" variant="outline" onClick={() => applyTemplate('adaptive-lab')} className="bg-green-50 border-green-300">
+                  🎯 Smart Lab
+                </Button>
                 <Button type="button" size="sm" variant="outline" onClick={() => applyTemplate('distributed-theory')}>
                   Distributed (3×1hr)
                 </Button>
@@ -427,7 +662,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
                 <Label htmlFor="type">Type *</Label>
                 <Select 
                   value={formData.type || 'Theory'} 
-                  onValueChange={(value) => setFormData(prev => ({ ...prev, type: value as 'Theory' | 'Lab' | 'Tutorial' }))}
+                  onValueChange={(value) => handleFieldChange('type', value as 'Theory' | 'Lab' | 'Tutorial')}
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="Select type" />
@@ -457,11 +692,15 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
                   id="weeklyHours"
                   type="number"
                   min="0"
+                  max={institutionConfig.periodsPerDay * institutionConfig.workingDays.length}
                   placeholder="0"
                   value={formData.weeklyHours || ''}
-                  onChange={(e) => setFormData(prev => ({ ...prev, weeklyHours: Number(e.target.value) }))}
+                  onChange={(e) => handleFieldChange('weeklyHours', Number(e.target.value))}
                   required
                 />
+                <p className="text-xs text-muted-foreground">
+                  Max: {institutionConfig.periodsPerDay * institutionConfig.workingDays.length} periods/week ({institutionConfig.workingDays.length} days × {institutionConfig.periodsPerDay} periods)
+                </p>
               </div>
             </div>
 
@@ -472,13 +711,14 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
                   id="sessionsPerWeek"
                   type="number"
                   min="0"
+                  max={getMaxSessionsPerWeek()}
                   placeholder="0"
                   value={formData.sessionsPerWeek || ''}
-                  onChange={(e) => setFormData(prev => ({ ...prev, sessionsPerWeek: Number(e.target.value) }))}
+                  onChange={(e) => handleFieldChange('sessionsPerWeek', Number(e.target.value))}
                   required
                 />
                 <p className="text-xs text-muted-foreground">
-                  Number of separate sessions per week (1 = single session, 2 = two sessions)
+                  Max: {getMaxSessionsPerWeek()} sessions (limited by {institutionConfig.workingDays.length} working days)
                 </p>
               </div>
               <div className="space-y-2">
@@ -504,13 +744,14 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
                   id="continuousHours"
                   type="number"
                   min="1"
+                  max={getMaxContinuousHours()}
                   placeholder="1"
                   value={formData.continuousHours || 1}
-                  onChange={(e) => setFormData(prev => ({ ...prev, continuousHours: Number(e.target.value) }))}
+                  onChange={(e) => handleFieldChange('continuousHours', Number(e.target.value))}
                   required
                 />
                 <p className="text-xs text-muted-foreground">
-                  Consecutive periods needed (1 = single period, 2 = continuous 2 periods, 4 = 4-hour block)
+                  Max: {getMaxContinuousHours()} periods (recommended limit for {institutionConfig.periodsPerDay} daily periods)
                 </p>
               </div>
               <div className="space-y-2">
@@ -548,27 +789,96 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
             </div>
 
             {formData.code && (
-              <div className="p-3 bg-blue-50 border border-blue-200 rounded">
-                <p className="text-sm text-blue-800 mb-2">
-                  <strong>Generated ID:</strong> {generateSubjectId(formData.code, formData.type || 'Theory')}
-                </p>
-                <div className="text-xs text-blue-700">
-                  <strong>Scheduling Preview:</strong>
-                  <ul className="ml-4 mt-1 space-y-1">
-                    <li>• <strong>Total Weekly Load:</strong> {formData.weeklyHours || 0} hours ({formData.weeklyHours || 0} periods)</li>
-                    <li>• <strong>Session Frequency:</strong> {formData.sessionsPerWeek || 0} session(s) per week</li>
-                    <li>• <strong>Session Duration:</strong> {formData.sessionDuration || 50} minutes ({Math.ceil((formData.sessionDuration || 50) / 50)} period(s))</li>
-                    <li>• <strong>Continuous Block:</strong> {formData.continuousHours || 1} consecutive period(s)</li>
-                    <li>• <strong>Time Preference:</strong> {formData.preferredTimeSlots?.[0] || 'Morning'}</li>
-                    <li>• <strong>Expected Appearance:</strong> 
-                      {formData.sessionsPerWeek === 1 ? (
-                        <span className="text-green-700">Single {formData.continuousHours || 1}-hour block per week</span>
-                      ) : (
-                        <span className="text-orange-700">{formData.sessionsPerWeek || 0} separate sessions per week</span>
+              <div className="space-y-3">
+                <div className="p-3 bg-blue-50 border border-blue-200 rounded">
+                  <p className="text-sm text-blue-800 mb-2">
+                    <strong>Generated ID:</strong> {generateSubjectId(formData.code, formData.type || 'Theory')}
+                  </p>
+                  <div className="text-xs text-blue-700">
+                    <strong>📅 Real-Time Scheduling Preview:</strong>
+                    <ul className="ml-4 mt-1 space-y-1">
+                      <li>• <strong>Total Weekly Load:</strong> {formData.weeklyHours || 0} hours ({formData.weeklyHours || 0} periods)</li>
+                      <li>• <strong>Session Frequency:</strong> {formData.sessionsPerWeek || 0} session(s) per week</li>
+                      <li>• <strong>Session Duration:</strong> {formData.sessionDuration || 50} minutes ({Math.ceil((formData.sessionDuration || 50) / 50)} period(s))</li>
+                      <li>• <strong>Continuous Block:</strong> {formData.continuousHours || 1} consecutive period(s)</li>
+                      <li>• <strong>Time Preference:</strong> {formData.preferredTimeSlots?.[0] || 'Morning'}</li>
+                      <li>• <strong>Institution Compatibility:</strong> 
+                        <span className={formData.continuousHours <= institutionConfig.periodsPerDay ? "text-green-700" : "text-red-700"}>
+                          {formData.continuousHours <= institutionConfig.periodsPerDay ? 
+                            `✓ Fits in daily schedule (${institutionConfig.periodsPerDay} periods/day)` : 
+                            `⚠ Exceeds daily periods (${institutionConfig.periodsPerDay} available)`
+                          }
+                        </span>
+                      </li>
+                      <li>• <strong>Timetable Appearance:</strong> 
+                        {formData.type === 'Lab' ? (
+                          <span className="text-purple-700">
+                            🧪 Lab: {formData.weeklyHours >= 2 ? 
+                              `${formData.weeklyHours}-hour continuous block` : 
+                              '⚠ Will be auto-corrected to 2+ hour block'
+                            }
+                          </span>
+                        ) : formData.sessionsPerWeek === 1 ? (
+                          <span className="text-green-700">
+                            📚 Single {formData.continuousHours || 1}-hour block per week
+                          </span>
+                        ) : (
+                          <span className="text-orange-700">
+                            📝 {formData.sessionsPerWeek || 0} separate {(formData.weeklyHours || 0) / (formData.sessionsPerWeek || 1)}-hour sessions per week
+                          </span>
+                        )}
+                      </li>
+                      {formData.weeklyHours > 0 && formData.sessionsPerWeek > 0 && (
+                        <li>• <strong>Weekly Distribution:</strong> 
+                          <span className="text-gray-700">
+                            {Array.from({length: Math.min(formData.sessionsPerWeek, institutionConfig.workingDays.length)}, (_, i) => 
+                              `${institutionConfig.workingDays[i] || `Day ${i+1}`}: ${formData.continuousHours || 1}h block`
+                            ).join(', ')}
+                          </span>
+                        </li>
                       )}
-                    </li>
-                  </ul>
+                    </ul>
+                  </div>
                 </div>
+
+                {/* Real-time validation feedback */}
+                {realTimeValidation.length > 0 && (
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded">
+                    <div className="flex items-center gap-2 text-amber-800 font-medium mb-2">
+                      <AlertCircle className="w-4 h-4" />
+                      ⚡ Real-Time Validation:
+                    </div>
+                    <ul className="text-amber-700 text-xs ml-4 space-y-1 list-disc">
+                      {realTimeValidation.map((warning, index) => (
+                        <li key={index}>{warning}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {/* Smart suggestions based on form data */}
+                {formData.type && formData.weeklyHours > 0 && (
+                  <div className="p-3 bg-green-50 border border-green-200 rounded">
+                    <div className="flex items-center gap-2 text-green-800 font-medium mb-2">
+                      <CheckCircle className="w-4 h-4" />
+                      💡 Smart Suggestions:
+                    </div>
+                    <ul className="text-green-700 text-xs ml-4 space-y-1 list-disc">
+                      {formData.type === 'Lab' && formData.weeklyHours < 2 && (
+                        <li>Consider increasing weekly hours to 2-3 for proper lab sessions</li>
+                      )}
+                      {formData.type === 'Theory' && formData.weeklyHours > 4 && (
+                        <li>Consider splitting into multiple sessions for better student engagement</li>
+                      )}
+                      {formData.sessionsPerWeek > institutionConfig.workingDays.length && (
+                        <li>Sessions per week exceeds working days - some days will have multiple sessions</li>
+                      )}
+                      {formData.continuousHours > 3 && (
+                        <li>Long continuous blocks may need breaks - check institution break configuration</li>
+                      )}
+                    </ul>
+                  </div>
+                )}
               </div>
             )}
 
@@ -774,21 +1084,21 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
                 <Label>Eligible Subjects *</Label>
                 <div className="grid grid-cols-3 gap-2 max-h-32 overflow-y-auto border rounded p-2">
                   {subjects.filter(s => s.code).map(subject => (
-                    <label key={subject.code} className="flex items-center gap-2">
+                    <label key={subject.id} className="flex items-center gap-2">
                       <input
                         type="checkbox"
-                        checked={facultyFormData.eligibleSubjects?.includes(subject.code) || false}
+                        checked={facultyFormData.eligibleSubjects?.includes(subject.id) || false}
                         onChange={(e) => {
                           const checked = e.target.checked;
                           setFacultyFormData(prev => ({
                             ...prev,
                             eligibleSubjects: checked
-                              ? [...(prev.eligibleSubjects || []), subject.code]
-                              : (prev.eligibleSubjects || []).filter(code => code !== subject.code)
+                              ? [...(prev.eligibleSubjects || []), subject.id]
+                              : (prev.eligibleSubjects || []).filter(id => id !== subject.id)
                           }));
                         }}
                       />
-                      <span className="text-sm">{subject.code}</span>
+                      <span className="text-sm">{subject.code} {subject.type === 'Lab' ? '(Lab)' : ''}</span>
                     </label>
                   ))}
                 </div>
@@ -1514,7 +1824,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         maxDailyHours: 4
       },
       leaveFrequency: 0.1,
-      preferredRooms: ['AD-B']
+      preferredRooms: ['AD-B', 'ADA']
     },
     {
       id: 'F002',
@@ -1530,7 +1840,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         maxDailyHours: 5
       },
       leaveFrequency: 0.08,
-      preferredRooms: ['AD-B']
+      preferredRooms: ['AD-B', 'ADA']
     },
     {
       id: 'F003',
@@ -1546,7 +1856,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         maxDailyHours: 5
       },
       leaveFrequency: 0.06,
-      preferredRooms: ['AD-B']
+      preferredRooms: ['AD-B', 'ADA']
     },
     {
       id: 'F004',
@@ -1562,7 +1872,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         maxDailyHours: 4
       },
       leaveFrequency: 0.07,
-      preferredRooms: ['AD-B']
+      preferredRooms: ['AD-B', 'ADA']
     },
     {
       id: 'F005',
@@ -1578,7 +1888,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         maxDailyHours: 4
       },
       leaveFrequency: 0.09,
-      preferredRooms: ['AD-B']
+      preferredRooms: ['AD-B', 'ADA']
     },
     {
       id: 'F006',
@@ -1594,7 +1904,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         maxDailyHours: 3
       },
       leaveFrequency: 0.05,
-      preferredRooms: ['AD-B']
+      preferredRooms: ['AD-B', 'ADA']
     },
     {
       id: 'F007',
@@ -1610,7 +1920,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         maxDailyHours: 4
       },
       leaveFrequency: 0.08,
-      preferredRooms: ['AD-B']
+      preferredRooms: ['AD-B', 'ADA']
     },
     {
       id: 'F009',
@@ -1626,7 +1936,7 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
         maxDailyHours: 4
       },
       leaveFrequency: 0.05,
-      preferredRooms: ['AD-B']
+      preferredRooms: ['AD-B', 'ADA']
     }
   ];
 
@@ -1639,9 +1949,20 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
       equipment: ['Projector', 'Whiteboard', 'Audio System'],
       availability: [],
       location: 'Civil Block'
+    },
+    {
+      id: 'AD-A',
+      name: 'AD-A',
+      type: 'Classroom',
+      capacity: 68,
+      equipment: ['Projector', 'Whiteboard', 'Audio System'],
+      availability: [],
+      location: 'Civil Block'
     }
   ];
 
+  // Sample batches - Only one batch to prevent duplicate faculty loading
+  // Add more batches if you need timetables for multiple sections
   const sampleBatches: StudentBatch[] = [
     {
       id: 'AIDS-B-2024-25',
@@ -1693,6 +2014,24 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
     
     // Also load the institution setup
     localStorage.setItem('institution', JSON.stringify(sampleInstitution));
+    
+    // Clear any existing timetables when loading fresh sample data
+    localStorage.removeItem('generatedTimetables');
+    localStorage.removeItem('savedTimetables');
+    localStorage.removeItem('savedTimetableRegistry');
+    
+    // Calculate expected total classes for verification
+    const totalExpectedClasses = sampleSubjects.reduce((total, subject) => {
+      return total + (subject.sessionsPerWeek || 0);
+    }, 0);
+    
+    console.log(`📚 Sample data loaded:`);
+    console.log(`   Subjects: ${sampleSubjects.length}`);
+    console.log(`   Faculty: ${sampleFaculty.length}`);
+    console.log(`   Rooms: ${sampleRooms.length}`);
+    console.log(`   Batches: ${sampleBatches.length}`);
+    console.log(`   Expected classes per batch: ${totalExpectedClasses}`);
+    console.log(`   Expected total classes: ${totalExpectedClasses * sampleBatches.length}`);
   };
 
   const handleSave = () => {
@@ -1752,9 +2091,22 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
 
   // Clear stored timetables to force regeneration
   const clearStoredTimetables = () => {
+    // Clear all timetable-related storage
     localStorage.removeItem('generatedTimetables');
+    localStorage.removeItem('savedTimetables');
+    localStorage.removeItem('savedTimetableRegistry');
+    
+    console.log('🧹 Cleared all stored timetable data:');
+    console.log('   - Generated timetables');
+    console.log('   - Saved timetables');
+    console.log('   - Timetable registry');
+    console.log('✨ Ready for fresh timetable generation!');
+    
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
+    
+    // Dispatch events to update all components
+    window.dispatchEvent(new CustomEvent('timetablesCleared'));
   };
 
   return (

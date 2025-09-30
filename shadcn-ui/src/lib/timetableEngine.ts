@@ -1177,13 +1177,21 @@ export class TimetableEngine {
                   }
                   
                   if (canScheduleContinuous && consecutiveSlots.length === periodsNeeded) {
+                    // IMPORTANT: Validate that continuous block doesn't cross breaks/lunch
+                    if (!this.isLabBlockValidWithBreaks(timeSlot.period, periodsNeeded)) {
+                      if (subject.code === 'U24ED311') {
+                        console.log(`🎯 EDI: FAILED - ${periodsNeeded} periods starting at ${timeSlot.day} P${timeSlot.period} would cross break/lunch`);
+                      }
+                      continue; // Skip this slot as it would be interrupted by breaks
+                    }
+                    
                     if (subject.code === 'U24ED311') {
-                      console.log(`🎯 EDI: SUCCESS! Scheduling ${periodsNeeded} periods starting at ${timeSlot.day} P${timeSlot.period}`);
+                      console.log(`🎯 EDI: SUCCESS! Scheduling ${periodsNeeded} periods starting at ${timeSlot.day} P${timeSlot.period} (break-validated)`);
                     }
                     
                     // Check if this is a preferred time slot
                     const isPreferred = this.isPreferredTimeSlot(timeSlot, subject, faculty);
-                    console.log(`✅ SCHEDULED (Continuous): ${subject.code} with ${faculty.name} at ${timeSlot.day} P${timeSlot.period}-P${timeSlot.period + periodsNeeded - 1} ${isPreferred ? '⭐ PREFERRED SLOT' : ''}`);
+                    console.log(`✅ SCHEDULED (Continuous): ${subject.code} with ${faculty.name} at ${timeSlot.day} P${timeSlot.period}-P${timeSlot.period + periodsNeeded - 1} ${isPreferred ? '⭐ PREFERRED SLOT' : ''} [BREAK-VALIDATED]`);
                     
                     // Schedule all consecutive periods
                     for (const consecutiveSlot of consecutiveSlots) {
@@ -1896,6 +1904,9 @@ export class TimetableEngine {
     const suitableRooms = variation.roomOrder.filter(r => r.capacity >= batch.size);
     let totalSessionsScheduled = 0;
     
+    const periodsNeeded = subject.continuousHours || 1;
+    console.log(`📝 Scheduling ${subject.code} (conflict prevention): ${subject.sessionsPerWeek} sessions of ${periodsNeeded} periods each`);
+    
     for (let session = 0; session < subject.sessionsPerWeek; session++) {
       let scheduled = false;
       
@@ -1914,32 +1925,98 @@ export class TimetableEngine {
       for (const day of availableDays) {
         for (const faculty of eligibleFaculty) {
           for (const room of suitableRooms) {
-            for (let period = 1; period <= this.institution.periodsPerDay; period++) {
-              // Check conflict with saved timetables
-              if (isSlotOccupied(faculty.id, room.id, day, period)) {
-                continue;
-              }
-              
-              const timeSlot = timeSlots.find(ts => ts.day === day && ts.period === period);
-              if (!timeSlot) continue;
-              
-              const entry: TimetableEntry = {
-                id: `entry-${Date.now()}-${Math.random()}`,
-                subject,
-                faculty,
-                room,
-                batch,
-                timeSlot
-              };
-              
-              const entryConflicts = this.checkHardConstraints(entry, entries);
-              if (entryConflicts.length === 0) {
-                entries.push(entry);
-                totalSessionsScheduled++;
-                scheduled = true;
-                break;
+            for (let period = 1; period <= this.institution.periodsPerDay - periodsNeeded + 1; period++) {
+              // For continuous subjects, check entire block for conflicts
+              if (periodsNeeded > 1) {
+                // Validate that continuous block doesn't cross breaks/lunch
+                if (!this.isLabBlockValidWithBreaks(period, periodsNeeded)) {
+                  console.log(`🚫 Conflict Prevention: ${subject.code} continuous block P${period}-P${period + periodsNeeded - 1} would cross break/lunch`);
+                  continue;
+                }
+                
+                // Check if entire block is free from conflicts with saved timetables
+                let blockFree = true;
+                const consecutiveSlots = [];
+                
+                for (let p = 0; p < periodsNeeded; p++) {
+                  const currentPeriod = period + p;
+                  if (isSlotOccupied(faculty.id, room.id, day, currentPeriod)) {
+                    blockFree = false;
+                    break;
+                  }
+                  
+                  const timeSlot = timeSlots.find(ts => ts.day === day && ts.period === currentPeriod);
+                  if (!timeSlot) {
+                    blockFree = false;
+                    break;
+                  }
+                  
+                  // Check for hard constraint conflicts
+                  const tempEntry: TimetableEntry = {
+                    id: `temp-${Date.now()}-${Math.random()}`,
+                    subject,
+                    faculty,
+                    room,
+                    batch,
+                    timeSlot
+                  };
+                  
+                  const tempConflicts = this.checkHardConstraints(tempEntry, entries);
+                  if (tempConflicts.length > 0) {
+                    blockFree = false;
+                    break;
+                  }
+                  
+                  consecutiveSlots.push(timeSlot);
+                }
+                
+                if (blockFree && consecutiveSlots.length === periodsNeeded) {
+                  console.log(`✅ SCHEDULED (Continuous + Conflict Prevention): ${subject.code} with ${faculty.name} at ${day} P${period}-P${period + periodsNeeded - 1} [BREAK-VALIDATED]`);
+                  
+                  // Schedule all consecutive periods
+                  for (const timeSlot of consecutiveSlots) {
+                    const entry: TimetableEntry = {
+                      id: `entry-${Date.now()}-${Math.random()}`,
+                      subject,
+                      faculty,
+                      room,
+                      batch,
+                      timeSlot
+                    };
+                    entries.push(entry);
+                  }
+                  
+                  totalSessionsScheduled++;
+                  scheduled = true;
+                  break;
+                }
               } else {
-                conflicts.push(...entryConflicts);
+                // Single period scheduling (original logic)
+                if (isSlotOccupied(faculty.id, room.id, day, period)) {
+                  continue;
+                }
+                
+                const timeSlot = timeSlots.find(ts => ts.day === day && ts.period === period);
+                if (!timeSlot) continue;
+                
+                const entry: TimetableEntry = {
+                  id: `entry-${Date.now()}-${Math.random()}`,
+                  subject,
+                  faculty,
+                  room,
+                  batch,
+                  timeSlot
+                };
+                
+                const entryConflicts = this.checkHardConstraints(entry, entries);
+                if (entryConflicts.length === 0) {
+                  entries.push(entry);
+                  totalSessionsScheduled++;
+                  scheduled = true;
+                  break;
+                } else {
+                  conflicts.push(...entryConflicts);
+                }
               }
             }
             if (scheduled) break;

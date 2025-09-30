@@ -415,6 +415,36 @@ export class TimetableEngine {
     return shuffled;
   }
 
+  public generateSingleClassTimetable(batchId: string, settings: OptimizationSettings): GeneratedTimetable {
+    const originalBatches = [...this.batches];
+    
+    // Filter to only the selected batch for single-class generation
+    const selectedBatch = this.batches.find(b => b.id === batchId);
+    if (!selectedBatch) {
+      throw new Error(`Batch ${batchId} not found for single-class generation`);
+    }
+    
+    console.log(`👤 SINGLE-CLASS GENERATION for ${selectedBatch.name}:`);
+    console.log(`   Only generating schedule for 1 batch (not ${originalBatches.length} batches)`);
+    
+    // Temporarily set batches to only the selected one
+    this.batches = [selectedBatch];
+    
+    // Generate timetable for just this batch
+    const result = this.generateTimetable(settings);
+    
+    // Customize result for single batch
+    result.batchIds = [batchId];
+    result.name = `${selectedBatch.name} Schedule`;
+    
+    console.log(`✅ Single-class result: ${result.entries.length} classes for ${selectedBatch.name} only`);
+    
+    // Restore original batches
+    this.batches = originalBatches;
+    
+    return result;
+  }
+
   public generateTimetable(settings: OptimizationSettings): GeneratedTimetable {
     const entries: TimetableEntry[] = [];
     const conflicts: Conflict[] = [];
@@ -631,9 +661,10 @@ export class TimetableEngine {
               e.faculty.id === faculty.id &&
               e.subject.type === 'Lab'
             ).length;
-            // Relaxed faculty constraints for lab scheduling  
-            const effectiveMaxDailyHours = Math.max(faculty.preferences.maxDailyHours, 6);
-            const effectiveMaxWeeklyLoad = Math.max(faculty.maxWeeklyLoad, 30);
+            // Progressive faculty constraint relaxation for lab scheduling
+            const relaxation = (variation as any).constraintRelaxation || { extraDailyHours: 0, extraWeeklyHours: 0 };
+            const effectiveMaxDailyHours = Math.max(faculty.preferences.maxDailyHours, 6) + relaxation.extraDailyHours;
+            const effectiveMaxWeeklyLoad = Math.max(faculty.maxWeeklyLoad, 30) + relaxation.extraWeeklyHours;
             
             if (
               labSessionsScheduledToday + 1 > effectiveMaxDailyHours ||
@@ -1065,19 +1096,24 @@ export class TimetableEngine {
             ).length;
             // If this subject is already scheduled at this period on more than 0 other days, skip this period for this batch
             if (samePeriodCount > 0) continue;
+            // Apply relaxed theory scheduling constraints based on attempt number
+            const relaxation = (variation as any).constraintRelaxation || { allowMultipleTheoryPerDay: false };
+            
             const alreadyScheduledToday = entries.find(e =>
               e.batch.id === batch.id &&
               e.timeSlot.day === timeSlot.day &&
               e.subject.id === subject.id &&
               e.subject.type === 'Theory'
             );
-            if (subject.type === 'Theory' && alreadyScheduledToday) {
+            // Allow multiple theory sessions per day in later attempts
+            if (subject.type === 'Theory' && alreadyScheduledToday && !relaxation.allowMultipleTheoryPerDay) {
               continue;
             }
 
             // Prevent consecutive theory classes of the same subject for the same batch
             // EXCEPT for continuous subjects that are meant to be scheduled consecutively
-            if (subject.type === 'Theory' && periodsNeeded === 1) {
+            // Relax this constraint in later attempts
+            if (subject.type === 'Theory' && periodsNeeded === 1 && !relaxation.allowMultipleTheoryPerDay) {
               const hasConsecutiveTheoryConflict = entries.some(e =>
                 e.batch.id === batch.id &&
                 e.timeSlot.day === timeSlot.day &&
@@ -1089,7 +1125,24 @@ export class TimetableEngine {
                 continue;
               }
             }
-            for (const faculty of eligibleFaculty) {
+            // Sort eligible faculty by current workload for better distribution
+            const facultyRelaxation = (variation as any).constraintRelaxation || { extraDailyHours: 0, extraWeeklyHours: 0, relaxFacultyDistribution: false };
+            
+            let facultyToConsider = [...eligibleFaculty];
+            if (facultyRelaxation.relaxFacultyDistribution) {
+              // In later attempts, prioritize faculty with less current workload
+              facultyToConsider = eligibleFaculty.sort((a, b) => {
+                const aWorkload = entries.filter(e => e.faculty.id === a.id).length;
+                const bWorkload = entries.filter(e => e.faculty.id === b.id).length;
+                return aWorkload - bWorkload;
+              });
+              console.log(`🔄 Faculty workload distribution for ${subject.code}: ${facultyToConsider.map(f => {
+                const workload = entries.filter(e => e.faculty.id === f.id).length;
+                return `${f.name}(${workload})`;
+              }).join(', ')}`);
+            }
+            
+            for (const faculty of facultyToConsider) {
               if (scheduled) break;
               
               // Add debugging for specific subject
@@ -1106,9 +1159,9 @@ export class TimetableEngine {
                 e.faculty.id === faculty.id &&
                 e.subject.type === 'Theory'
               ).length;
-              // Relaxed faculty constraints to allow full scheduling
-              const effectiveMaxDailyHours = Math.max(faculty.preferences.maxDailyHours, 6); // Allow at least 6 hours per day
-              const effectiveMaxWeeklyLoad = Math.max(faculty.maxWeeklyLoad, 30); // Allow at least 30 hours per week
+              
+              const effectiveMaxDailyHours = Math.max(faculty.preferences.maxDailyHours, 6) + facultyRelaxation.extraDailyHours;
+              const effectiveMaxWeeklyLoad = Math.max(faculty.maxWeeklyLoad, 30) + facultyRelaxation.extraWeeklyHours;
               
               if (
                 subject.type === 'Theory' &&
@@ -1468,32 +1521,124 @@ export class TimetableEngine {
   }
 
   // Multi-class generation with staff conflict prevention
-  public generateMultiClassTimetable(batchIds: string[], settings: OptimizationSettings, savedTimetables: GeneratedTimetable[] = []): GeneratedTimetable {
+  public generateMultiClassTimetable(batchIds: string[], settings: OptimizationSettings, savedTimetables: GeneratedTimetable[] = []): GeneratedTimetable[] {
     const originalBatches = [...this.batches];
     
-    // Filter batches to only include requested ones
-    this.batches = this.batches.filter(batch => batchIds.includes(batch.id));
+    console.log(`🎯 SEPARATE MULTI-CLASS GENERATION:`);
+    console.log(`   Selected batches: ${batchIds.map(id => this.batches.find(b => b.id === id)?.name).join(', ')}`);
+    console.log(`   Will generate ${batchIds.length} separate timetables with faculty conflict prevention`);
     
-    if (this.batches.length === 0) {
-      throw new Error('No valid batches found for the provided batch IDs');
+    const results: GeneratedTimetable[] = [];
+    const cumulativeOccupiedSlots: TimetableEntry[] = [];
+    
+    // Add pre-occupied slots from other saved timetables (not being regenerated)
+    const externalPreOccupiedSlots = this.extractPreOccupiedSlots(savedTimetables, batchIds);
+    cumulativeOccupiedSlots.push(...externalPreOccupiedSlots);
+    
+    console.log(`   🚫 Starting with ${externalPreOccupiedSlots.length} pre-occupied slots from other saved timetables`);
+    
+    // Generate separate timetable for each batch
+    for (let i = 0; i < batchIds.length; i++) {
+      const batchId = batchIds[i];
+      const batch = originalBatches.find(b => b.id === batchId);
+      
+      if (!batch) {
+        console.error(`❌ Batch ${batchId} not found`);
+        continue;
+      }
+      
+      console.log(`\n📋 Generating timetable ${i + 1}/${batchIds.length} for ${batch.name}:`);
+      
+      // Set current batch for generation
+      this.batches = [batch];
+      
+      // Generate timetable with all previously generated classes as occupied slots
+      console.log(`   🚫 Avoiding conflicts with ${cumulativeOccupiedSlots.length} occupied time slots`);
+      const timetable = this.generateTimetableWithConflictPrevention(settings, cumulativeOccupiedSlots);
+      
+      // Customize the timetable
+      timetable.name = `${batch.name} Schedule`;
+      timetable.batchIds = [batchId];
+      
+      console.log(`   ✅ Generated ${timetable.entries.length} classes for ${batch.name}`);
+      
+      // Add faculty usage analysis
+      const facultyUsage = new Map<string, number>();
+      timetable.entries.forEach(entry => {
+        const facultyName = entry.faculty.name;
+        facultyUsage.set(facultyName, (facultyUsage.get(facultyName) || 0) + 1);
+      });
+      
+      console.log(`   👨‍🏫 Faculty usage in ${batch.name}:`);
+      facultyUsage.forEach((count, facultyName) => {
+        console.log(`      ${facultyName}: ${count} classes`);
+      });
+      
+      // Add ALL faculty-occupied slots to prevent double-booking faculty
+      // Rooms can be shared between batches, but faculty cannot be double-booked
+      const allFacultySlots = timetable.entries; // Block all faculty time slots for this batch
+      
+      console.log(`   🚫 Faculty conflict prevention: Blocking ${allFacultySlots.length}/${timetable.entries.length} slots (100% faculty protection)`);
+      
+      // Block all faculty slots to prevent double-booking faculty
+      // Different batches can use the same room, but not the same faculty
+      cumulativeOccupiedSlots.push(...allFacultySlots);
+      
+      results.push(timetable);
     }
-
-    // Create pre-occupied slots from saved timetables to prevent staff conflicts
-    // EXCLUDE timetables for the same batches being regenerated
-    const preOccupiedSlots = this.extractPreOccupiedSlots(savedTimetables, batchIds);
     
-    console.log(`Generating timetable for ${this.batches.length} batches with ${preOccupiedSlots.length} pre-occupied slots`);
+    console.log(`\n🎉 SEPARATE TIMETABLES COMPLETED:`);
+    console.log(`   Generated ${results.length} individual timetables`);
+    results.forEach((tt, idx) => {
+      console.log(`   ${idx + 1}. ${tt.name}: ${tt.entries.length} classes`);
+    });
     
-    // Generate timetable with conflict prevention
-    const result = this.generateTimetableWithConflictPrevention(settings, preOccupiedSlots);
-    
-    // Add batch IDs to the result
-    result.batchIds = batchIds;
+    // Verify no faculty conflicts between timetables
+    this.validateNoFacultyConflictsBetweenTimetables(results);
     
     // Restore original batches
     this.batches = originalBatches;
     
-    return result;
+    return results;
+  }
+
+  private validateNoFacultyConflictsBetweenTimetables(timetables: GeneratedTimetable[]): void {
+    console.log(`🔍 VALIDATING NO FACULTY CONFLICTS between ${timetables.length} timetables:`);
+    
+    const allEntries: TimetableEntry[] = [];
+    timetables.forEach(tt => allEntries.push(...tt.entries));
+    
+    const conflicts: { faculty: string, slot: string, timetables: string[] }[] = [];
+    
+    for (let i = 0; i < allEntries.length; i++) {
+      for (let j = i + 1; j < allEntries.length; j++) {
+        const entry1 = allEntries[i];
+        const entry2 = allEntries[j];
+        
+        // Check if same faculty, same time slot, different batches
+        if (entry1.faculty.id === entry2.faculty.id &&
+            entry1.timeSlot.day === entry2.timeSlot.day &&
+            entry1.timeSlot.period === entry2.timeSlot.period &&
+            entry1.batch.id !== entry2.batch.id) {
+          
+          conflicts.push({
+            faculty: entry1.faculty.name,
+            slot: `${entry1.timeSlot.day} P${entry1.timeSlot.period}`,
+            timetables: [entry1.batch.name, entry2.batch.name]
+          });
+        }
+      }
+    }
+    
+    if (conflicts.length > 0) {
+      console.error(`❌ FACULTY CONFLICTS DETECTED:`);
+      conflicts.forEach(conflict => {
+        console.error(`   ${conflict.faculty} at ${conflict.slot}: ${conflict.timetables.join(' vs ')}`);
+      });
+      throw new Error(`Faculty conflicts detected between timetables. Check console for details.`);
+    } else {
+      console.log(`   ✅ NO CONFLICTS - All faculty have unique time slots across all timetables`);
+    }
   }
 
   private extractPreOccupiedSlots(savedTimetables: GeneratedTimetable[], currentBatchIds?: string[]): TimetableEntry[] {
@@ -1546,9 +1691,9 @@ export class TimetableEngine {
     }
 
     // Retry mechanism to ensure we get all expected classes
-    const maxAttempts = 10;
+    const maxAttempts = 20;
     const targetClassCount = expectedClasses;
-    const minAcceptableCount = Math.floor(expectedClasses * 0.85); // Accept 85% as minimum
+    const minAcceptableCount = Math.floor(expectedClasses * 0.80); // Accept 80% as minimum for multi-class
     let bestResult: { entries: TimetableEntry[], conflicts: Conflict[], score: number } | null = null;
     
     console.log(`🎯 TARGET: ${targetClassCount} classes (minimum acceptable: ${minAcceptableCount})`);
@@ -1571,6 +1716,15 @@ export class TimetableEngine {
         return (seed - 1) / 2147483646;
       };
       
+      // Progressive constraint relaxation for later attempts - more aggressive for theory subjects
+      const constraintRelaxation = {
+        extraDailyHours: attempt > 8 ? 3 : (attempt > 3 ? 2 : (attempt > 1 ? 1 : 0)), // Allow 1-3 extra hours starting attempt 2
+        extraWeeklyHours: attempt > 8 ? 15 : (attempt > 3 ? 10 : (attempt > 1 ? 5 : 0)), // Allow 5-15 extra weekly hours starting attempt 2
+        relaxBreakRules: attempt > 10, // Allow breaks interruption after attempt 10
+        allowMultipleTheoryPerDay: attempt > 5, // Allow multiple theory sessions per day for same subject after attempt 5
+        relaxFacultyDistribution: attempt > 3, // Allow less balanced faculty distribution after attempt 3
+      };
+
       const variation = {
         batchOrder: this.shuffleArraySeeded([...this.batches], seededRandom),
         subjectOrder: this.shuffleArraySeeded([...this.subjects], seededRandom),
@@ -1579,7 +1733,8 @@ export class TimetableEngine {
         workingDaysOrder: this.shuffleArraySeeded([...this.institution.workingDays], seededRandom),
         startPeriodOffset: Math.floor(seededRandom() * 3) + 1,
         prioritizeEarlierSlots: seededRandom() > 0.5,
-        seededRandom: seededRandom
+        seededRandom: seededRandom,
+        constraintRelaxation: constraintRelaxation
       };
 
       // Schedule with conflict prevention
@@ -1646,8 +1801,8 @@ export class TimetableEngine {
       }
       
       // If we got close enough and this is a later attempt, consider accepting
-      if (attempt >= 5 && entries.length >= minAcceptableCount) {
-        console.log(`✅ ACCEPTABLE! Got ${entries.length}/${targetClassCount} classes (${((entries.length/targetClassCount)*100).toFixed(1)}%) on attempt ${attempt}`);
+      if (attempt >= 3 && entries.length >= minAcceptableCount) {
+        console.log(`✅ ACCEPTABLE! Got ${entries.length}/${targetClassCount} classes (${((entries.length/targetClassCount)*100).toFixed(1)}%) on attempt ${attempt} - Multi-class scenario`);
         if (!bestResult || entries.length > bestResult.entries.length) {
           bestResult = { entries, conflicts, score };
         }
@@ -1681,16 +1836,16 @@ export class TimetableEngine {
     preOccupiedSlots: TimetableEntry[],
     settings: OptimizationSettings
   ) {
-    // Helper function to check if a faculty/room/time slot is occupied by saved timetables
+    // Helper function to check if a faculty is occupied by saved timetables (rooms can be shared between batches)
     const isSlotOccupied = (facultyId: string, roomId: string, day: string, period: number): boolean => {
-      const conflict = preOccupiedSlots.find(slot => 
-        (slot.faculty.id === facultyId || slot.room.id === roomId) &&
+      const facultyConflict = preOccupiedSlots.find(slot => 
+        slot.faculty.id === facultyId &&
         slot.timeSlot.day === day && 
         slot.timeSlot.period === period
       );
       
-      if (conflict) {
-        console.log(`🚫 Conflict detected: ${day} P${period} - Faculty: ${facultyId === conflict.faculty.id ? 'OCCUPIED by ' + conflict.faculty.name : 'Free'}, Room: ${roomId === conflict.room.id ? 'OCCUPIED by ' + conflict.subject.code : 'Free'}`);
+      if (facultyConflict) {
+        console.log(`🚫 Faculty conflict detected: ${day} P${period} - Faculty ${facultyConflict.faculty.name} already teaching ${facultyConflict.subject.code}`);
         return true;
       }
       
@@ -1900,12 +2055,18 @@ export class TimetableEngine {
     variation: any,
     isSlotOccupied: (facultyId: string, roomId: string, day: string, period: number) => boolean
   ) {
-    const eligibleFaculty = variation.facultyOrder.filter(f => f.eligibleSubjects.includes(subject.id));
-    const suitableRooms = variation.roomOrder.filter(r => r.capacity >= batch.size);
+    let eligibleFaculty = variation.facultyOrder.filter(f => f.eligibleSubjects.includes(subject.id));
+    let suitableRooms = variation.roomOrder.filter(r => r.capacity >= batch.size);
     let totalSessionsScheduled = 0;
     
     const periodsNeeded = subject.continuousHours || 1;
     console.log(`📝 Scheduling ${subject.code} (conflict prevention): ${subject.sessionsPerWeek} sessions of ${periodsNeeded} periods each`);
+    
+    // Add faculty assignment flexibility - shuffle eligible faculty for variety
+    if (variation.randomizeSlotSelection && eligibleFaculty.length > 1) {
+      eligibleFaculty = this.shuffleArraySeeded([...eligibleFaculty], variation.seededRandom);
+      console.log(`🔄 Shuffled faculty order for ${subject.code}: ${eligibleFaculty.map(f => f.name).join(', ')}`);
+    }
     
     for (let session = 0; session < subject.sessionsPerWeek; session++) {
       let scheduled = false;
@@ -1922,38 +2083,103 @@ export class TimetableEngine {
           })
         : this.institution.workingDays;
         
-      for (const day of availableDays) {
-        for (const faculty of eligibleFaculty) {
-          for (const room of suitableRooms) {
-            for (let period = 1; period <= this.institution.periodsPerDay - periodsNeeded + 1; period++) {
-              // For continuous subjects, check entire block for conflicts
-              if (periodsNeeded > 1) {
-                // Validate that continuous block doesn't cross breaks/lunch
-                if (!this.isLabBlockValidWithBreaks(period, periodsNeeded)) {
-                  console.log(`🚫 Conflict Prevention: ${subject.code} continuous block P${period}-P${period + periodsNeeded - 1} would cross break/lunch`);
-                  continue;
-                }
-                
-                // Check if entire block is free from conflicts with saved timetables
-                let blockFree = true;
-                const consecutiveSlots = [];
-                
-                for (let p = 0; p < periodsNeeded; p++) {
-                  const currentPeriod = period + p;
-                  if (isSlotOccupied(faculty.id, room.id, day, currentPeriod)) {
-                    blockFree = false;
-                    break;
+      // Try multiple passes with increasing faculty flexibility
+      for (let flexPass = 0; flexPass < 3 && !scheduled; flexPass++) {
+        console.log(`🎯 Pass ${flexPass + 1}/3 for ${subject.code} session ${session + 1}`);
+        
+        for (const day of availableDays) {
+          // For flexibility passes 2 and 3, try different faculty orders
+          let facultyToTry = [...eligibleFaculty];
+          if (flexPass === 1) {
+            // Try reverse order
+            facultyToTry = [...eligibleFaculty].reverse();
+          } else if (flexPass === 2) {
+            // Try faculty with less current workload first
+            facultyToTry = [...eligibleFaculty].sort((a, b) => {
+              const aWorkload = entries.filter(e => e.faculty.id === a.id).length;
+              const bWorkload = entries.filter(e => e.faculty.id === b.id).length;
+              return aWorkload - bWorkload;
+            });
+          }
+          
+          for (const faculty of facultyToTry) {
+            for (const room of suitableRooms) {
+              for (let period = 1; period <= this.institution.periodsPerDay - periodsNeeded + 1; period++) {
+                // For continuous subjects, check entire block for conflicts
+                if (periodsNeeded > 1) {
+                  // Validate that continuous block doesn't cross breaks/lunch
+                  if (!this.isLabBlockValidWithBreaks(period, periodsNeeded)) {
+                    console.log(`🚫 Conflict Prevention: ${subject.code} continuous block P${period}-P${period + periodsNeeded - 1} would cross break/lunch`);
+                    continue;
                   }
                   
-                  const timeSlot = timeSlots.find(ts => ts.day === day && ts.period === currentPeriod);
-                  if (!timeSlot) {
-                    blockFree = false;
-                    break;
+                  // Check if entire block is free from conflicts with saved timetables
+                  let blockFree = true;
+                  const consecutiveSlots = [];
+                  
+                  for (let p = 0; p < periodsNeeded; p++) {
+                    const currentPeriod = period + p;
+                    if (isSlotOccupied(faculty.id, room.id, day, currentPeriod)) {
+                      blockFree = false;
+                      break;
+                    }
+                    
+                    const timeSlot = timeSlots.find(ts => ts.day === day && ts.period === currentPeriod);
+                    if (!timeSlot) {
+                      blockFree = false;
+                      break;
+                    }
+                    
+                    // Check for hard constraint conflicts
+                    const tempEntry: TimetableEntry = {
+                      id: `temp-${Date.now()}-${Math.random()}`,
+                      subject,
+                      faculty,
+                      room,
+                      batch,
+                      timeSlot
+                    };
+                    
+                    const tempConflicts = this.checkHardConstraints(tempEntry, entries);
+                    if (tempConflicts.length > 0) {
+                      blockFree = false;
+                      break;
+                    }
+                    
+                    consecutiveSlots.push(timeSlot);
                   }
                   
-                  // Check for hard constraint conflicts
-                  const tempEntry: TimetableEntry = {
-                    id: `temp-${Date.now()}-${Math.random()}`,
+                  if (blockFree && consecutiveSlots.length === periodsNeeded) {
+                    console.log(`✅ SCHEDULED (Continuous + Conflict Prevention): ${subject.code} with ${faculty.name} at ${day} P${period}-P${period + periodsNeeded - 1} [BREAK-VALIDATED]`);
+                    
+                    // Schedule all consecutive periods
+                    for (const timeSlot of consecutiveSlots) {
+                      const entry: TimetableEntry = {
+                        id: `entry-${Date.now()}-${Math.random()}`,
+                        subject,
+                        faculty,
+                        room,
+                        batch,
+                        timeSlot
+                      };
+                      entries.push(entry);
+                    }
+                    
+                    totalSessionsScheduled++;
+                    scheduled = true;
+                    break;
+                  }
+                } else {
+                  // Single period scheduling (original logic)
+                  if (isSlotOccupied(faculty.id, room.id, day, period)) {
+                    continue;
+                  }
+                  
+                  const timeSlot = timeSlots.find(ts => ts.day === day && ts.period === period);
+                  if (!timeSlot) continue;
+                  
+                  const entry: TimetableEntry = {
+                    id: `entry-${Date.now()}-${Math.random()}`,
                     subject,
                     faculty,
                     room,
@@ -1961,71 +2187,33 @@ export class TimetableEngine {
                     timeSlot
                   };
                   
-                  const tempConflicts = this.checkHardConstraints(tempEntry, entries);
-                  if (tempConflicts.length > 0) {
-                    blockFree = false;
-                    break;
-                  }
-                  
-                  consecutiveSlots.push(timeSlot);
-                }
-                
-                if (blockFree && consecutiveSlots.length === periodsNeeded) {
-                  console.log(`✅ SCHEDULED (Continuous + Conflict Prevention): ${subject.code} with ${faculty.name} at ${day} P${period}-P${period + periodsNeeded - 1} [BREAK-VALIDATED]`);
-                  
-                  // Schedule all consecutive periods
-                  for (const timeSlot of consecutiveSlots) {
-                    const entry: TimetableEntry = {
-                      id: `entry-${Date.now()}-${Math.random()}`,
-                      subject,
-                      faculty,
-                      room,
-                      batch,
-                      timeSlot
-                    };
+                  const entryConflicts = this.checkHardConstraints(entry, entries);
+                  if (entryConflicts.length === 0) {
                     entries.push(entry);
+                    totalSessionsScheduled++;
+                    scheduled = true;
+                    console.log(`✅ SCHEDULED (Theory + Conflict Prevention): ${subject.code} with ${faculty.name} at ${day} P${period} (Pass ${flexPass + 1})`);
+                    break;
+                  } else {
+                    conflicts.push(...entryConflicts);
                   }
-                  
-                  totalSessionsScheduled++;
-                  scheduled = true;
-                  break;
                 }
-              } else {
-                // Single period scheduling (original logic)
-                if (isSlotOccupied(faculty.id, room.id, day, period)) {
-                  continue;
-                }
-                
-                const timeSlot = timeSlots.find(ts => ts.day === day && ts.period === period);
-                if (!timeSlot) continue;
-                
-                const entry: TimetableEntry = {
-                  id: `entry-${Date.now()}-${Math.random()}`,
-                  subject,
-                  faculty,
-                  room,
-                  batch,
-                  timeSlot
-                };
-                
-                const entryConflicts = this.checkHardConstraints(entry, entries);
-                if (entryConflicts.length === 0) {
-                  entries.push(entry);
-                  totalSessionsScheduled++;
-                  scheduled = true;
-                  break;
-                } else {
-                  conflicts.push(...entryConflicts);
-                }
+                if (scheduled) break;
               }
+              if (scheduled) break;
             }
             if (scheduled) break;
           }
           if (scheduled) break;
         }
-        if (scheduled) break;
       }
-      if (scheduled) break;
+      if (!scheduled) {
+        console.warn(`⚠️  Could not schedule session ${session + 1} for ${subject.code} despite ${3} flexibility passes`);
+      }
+    }
+    
+    if (totalSessionsScheduled < subject.sessionsPerWeek) {
+      console.warn(`⚠️  Scheduled only ${totalSessionsScheduled}/${subject.sessionsPerWeek} sessions for ${subject.code} in batch ${batch.name}`);
     }
   }
 

@@ -113,6 +113,19 @@ export interface GeneratedTimetable {
   score: number;
   generatedAt: string;
   status: 'Draft' | 'Under Review' | 'Approved' | 'Published';
+  batchIds: string[]; // Track which batches this timetable covers
+  isSaved?: boolean; // Whether this timetable is saved for conflict checking
+}
+
+export interface SavedTimetableRegistry {
+  savedTimetables: GeneratedTimetable[];
+  lastUpdated: string;
+}
+
+export interface MultiClassGenerationRequest {
+  batchIds: string[];
+  excludeSavedConflicts: boolean;
+  prioritizeStaffAvailability: boolean;
 }
 
 export interface Conflict {
@@ -133,4 +146,5 @@ export interface OptimizationSettings {
     studentSchedule: number;
     constraints: number;
   };
+  avoidedPatterns?: { day: string; period: number }[]; // For single-class pattern avoidance
 }

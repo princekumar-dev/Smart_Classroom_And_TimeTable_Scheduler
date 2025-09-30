@@ -138,7 +138,7 @@ export default function TimetableOptimizer({ onComplete }: TimetableOptimizerPro
         setCurrentStep('Generating multi-class timetable with staff conflict prevention...');
         console.log(`� Multi-class mode: User explicitly selected multi-class generation`);
         
-        const timetable = engine.generateMultiClassTimetable(selectedBatchIds, {
+        const separateTimetables = engine.generateMultiClassTimetable(selectedBatchIds, {
           maxIterations: 2000,
           timeLimit: 60,
           priorityWeights: {
@@ -149,14 +149,19 @@ export default function TimetableOptimizer({ onComplete }: TimetableOptimizerPro
           }
         }, currentSavedTimetables);
 
-        if (currentSavedTimetables.length > 0) {
-          timetable.name = `Multi-Class Schedule (${selectedBatches.map(b => b.name).join(', ')}) [${currentSavedTimetables.length} conflicts avoided]`;
-          console.log(`✅ Multi-class generated with conflict prevention: ${timetable.entries.length} classes scheduled, ${currentSavedTimetables.length} saved timetables respected`);
-        } else {
-          timetable.name = `Multi-Class Schedule (${selectedBatches.map(b => b.name).join(', ')})`;
-        }
+        // Add descriptive names and push all separate timetables
+        separateTimetables.forEach((timetable, index) => {
+          const batchName = selectedBatches[index].name;
+          if (currentSavedTimetables.length > 0) {
+            timetable.name = `${batchName} Schedule [${currentSavedTimetables.length} conflicts avoided]`;
+            console.log(`✅ ${batchName} timetable generated with conflict prevention: ${timetable.entries.length} classes scheduled`);
+          } else {
+            timetable.name = `${batchName} Schedule`;
+          }
+        });
         
-        timetables.push(timetable);
+        timetables.push(...separateTimetables);
+        console.log(`🎉 Generated ${separateTimetables.length} separate timetables for multi-class scheduling`);
       } else {
         // User chose single-class mode - use simple generation with pattern avoidance
         setCurrentStep('Generating single-class timetable...');
@@ -179,7 +184,7 @@ export default function TimetableOptimizer({ onComplete }: TimetableOptimizerPro
           console.log(`🚫 Avoiding ${savedSameBatchSlots.length} time slots from saved schedules for pattern variation`);
           
           // Generate with different randomization seed to get different pattern
-          const timetable = engine.generateTimetable({
+          const timetable = engine.generateSingleClassTimetable(selectedBatchIds[0], {
             maxIterations: 2000,
             timeLimit: 60,
             priorityWeights: {
@@ -187,7 +192,8 @@ export default function TimetableOptimizer({ onComplete }: TimetableOptimizerPro
               roomUtilization: 0.3,
               studentSchedule: 0.3,
               constraints: 0.2
-            }
+            },
+            avoidedPatterns: savedSameBatchSlots.map(slot => ({ day: slot.day, period: slot.period }))
           });
 
           timetable.name = `${selectedBatches[0].name} Schedule (Alternative Pattern)`;
@@ -196,7 +202,7 @@ export default function TimetableOptimizer({ onComplete }: TimetableOptimizerPro
           timetables.push(timetable);
         } else {
           // Original single-class generation when no saved timetables exist
-          const timetable1 = engine.generateTimetable({
+          const timetable1 = engine.generateSingleClassTimetable(selectedBatchIds[0], {
             maxIterations: 1000,
             timeLimit: 30,
             priorityWeights: {
@@ -207,7 +213,7 @@ export default function TimetableOptimizer({ onComplete }: TimetableOptimizerPro
             }
           });
 
-          const timetable2 = engine.generateTimetable({
+          const timetable2 = engine.generateSingleClassTimetable(selectedBatchIds[0], {
             maxIterations: 2000,
             timeLimit: 60,
             priorityWeights: {

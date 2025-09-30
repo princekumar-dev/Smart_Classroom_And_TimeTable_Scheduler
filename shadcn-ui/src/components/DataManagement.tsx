@@ -1965,6 +1965,22 @@ export default function DataManagement({ onComplete }: DataManagementProps) {
   // Add more batches if you need timetables for multiple sections
   const sampleBatches: StudentBatch[] = [
     {
+      id: 'AIDS-A-2024-25',
+      name: 'AIDS-A 2024-25',
+      department: 'Artificial Intelligence And Data Science',
+      year: 2,
+      section: 'A',
+      size: 68,
+      mandatorySubjects: [
+        'U24MA302', 'U24AD301', 'U24AD302', 'U24AD303', 'U24EC310', 'U24MC313',
+        'U24AD304-Lab', 'U24AD302-Lab', 'U24AD303-Lab', 'U24EC310-Lab',
+        'U24TP310', 'U24ED311', 'U24RM317'
+      ],
+      electiveGroups: [],
+      maxDailyClasses: 8,
+      specialRequirements: ['Lab Access Required', 'Computer Access', 'AI/ML Lab Access']
+    },
+    {
       id: 'AIDS-B-2024-25',
       name: 'AIDS-B 2024-25',
       department: 'Artificial Intelligence And Data Science',

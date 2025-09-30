@@ -13,7 +13,9 @@ import {
   FileText,
   CheckCircle,
   AlertCircle,
-  Clock
+  Clock,
+  Archive,
+  AlertTriangle
 } from 'lucide-react';
 import InstitutionSetup from '@/components/InstitutionSetup';
 import DataManagement from '@/components/DataManagement';
@@ -44,6 +46,7 @@ export default function Index() {
   
   // Real-time timetables from localStorage
   const [recentTimetables, setRecentTimetables] = useState<any[]>([]);
+  const [savedTimetables, setSavedTimetables] = useState<any[]>([]);
 
   useEffect(() => {
     const updateStats = () => {
@@ -59,6 +62,18 @@ export default function Index() {
       // Load recent timetables
       const timetables = JSON.parse(localStorage.getItem('generatedTimetables') || '[]');
       setRecentTimetables(timetables);
+      
+      // Load saved timetables
+      try {
+        const saved = localStorage.getItem('savedTimetableRegistry');
+        if (saved) {
+          const registry = JSON.parse(saved);
+          setSavedTimetables(registry.timetables || []);
+        }
+      } catch (error) {
+        console.error('Error loading saved timetables:', error);
+        setSavedTimetables([]);
+      }
     };
 
     // Initial load
@@ -75,8 +90,22 @@ export default function Index() {
       setRecentTimetables(timetables);
     };
 
+    // Listen for saved timetable updates
+    const handleTimetableSaved = () => {
+      try {
+        const saved = localStorage.getItem('savedTimetableRegistry');
+        if (saved) {
+          const registry = JSON.parse(saved);
+          setSavedTimetables(registry.timetables || []);
+        }
+      } catch (error) {
+        console.error('Error loading saved timetables:', error);
+      }
+    };
+
     window.addEventListener('dataUpdated', handleDataUpdate);
     window.addEventListener('timetablesGenerated', handleTimetableUpdate);
+    window.addEventListener('timetableSaved', handleTimetableSaved);
     
     // Also listen for storage changes (if data is modified elsewhere)
     window.addEventListener('storage', updateStats);
@@ -84,6 +113,7 @@ export default function Index() {
     return () => {
       window.removeEventListener('dataUpdated', handleDataUpdate);
       window.removeEventListener('timetablesGenerated', handleTimetableUpdate);
+      window.removeEventListener('timetableSaved', handleTimetableSaved);
       window.removeEventListener('storage', updateStats);
     };
   }, [activeTab]);
@@ -246,6 +276,81 @@ export default function Index() {
                 ))}
               </CardContent>
             </Card>
+
+            {/* Recent Saved Timetables */}
+            {savedTimetables.length > 0 && (
+              <Card>
+                <CardHeader>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Archive className="w-5 h-5 text-green-600" />
+                      <CardTitle>Recent Saved Timetables</CardTitle>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Badge variant="secondary">{savedTimetables.length} saved</Badge>
+                      <Button 
+                        variant="outline" 
+                        size="sm"
+                        onClick={() => setActiveTab('viewer')}
+                      >
+                        View All
+                      </Button>
+                    </div>
+                  </div>
+                  <CardDescription>
+                    Multi-class timetables ready for review and export
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+                    {savedTimetables.slice(0, 6).map((timetable: any) => (
+                      <Card key={timetable.id} className="hover:shadow-md transition-shadow cursor-pointer">
+                        <CardContent className="p-4" onClick={() => setActiveTab('viewer')}>
+                          <div className="flex items-start justify-between mb-2">
+                            <div>
+                              <h4 className="font-semibold text-sm truncate">{timetable.name}</h4>
+                              <p className="text-xs text-muted-foreground">
+                                {new Date(timetable.generatedAt).toLocaleDateString()}
+                              </p>
+                            </div>
+                            <Badge variant="outline" className="text-xs">
+                              {timetable.score}%
+                            </Badge>
+                          </div>
+                          
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                              <Users className="w-3 h-3" />
+                              <span>{timetable.batchIds?.length || 0} batch(es)</span>
+                              <Calendar className="w-3 h-3 ml-2" />
+                              <span>{timetable.entries.length} classes</span>
+                            </div>
+                            {timetable.conflicts.length > 0 && (
+                              <div className="flex items-center gap-1 text-xs text-orange-600">
+                                <AlertTriangle className="w-3 h-3" />
+                                <span>{timetable.conflicts.length} conflicts</span>
+                              </div>
+                            )}
+                          </div>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                  
+                  {savedTimetables.length > 6 && (
+                    <div className="mt-4 text-center">
+                      <Button 
+                        variant="ghost" 
+                        onClick={() => setActiveTab('viewer')}
+                        className="text-sm"
+                      >
+                        View {savedTimetables.length - 6} more saved timetables...
+                      </Button>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
 
             {/* Quick Actions */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
